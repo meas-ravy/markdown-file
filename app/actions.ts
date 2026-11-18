@@ -1,10 +1,10 @@
 "use server";
 
-import { mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { isInside, pathError } from "@/lib/paths";
 
-// ponytail: no auth — fine for a local app. Server Functions are public POST endpoints,
-// so add auth before deploying anywhere others can reach it.
+
 const DIR = path.join(process.cwd(), "data");
 
 // Disk storage only where the server can write and isn't public: off on Vercel (read-only, public URL),
@@ -27,32 +27,56 @@ export type Highlight = { id: string; text: string; prefix: string; color: strin
 const HL_FILE = path.join(DIR, ".highlights.json");
 const COLORS = ["yellow", "green", "blue", "pink"];
 
-// Trust boundary: names come from the client. Allow a plain file name only, never a path.
-function fileOf(name: string) {
+// Trust boundary: paths come from the client. pathError rejects "..", leading dots, and odd characters,
+// so every path stays inside data/.
+function dirOf(p: string) {
   assertDisk();
-  const n = String(name).trim();
-  if (!n || n.length > 200 || /[/\\\0:*?"<>|]/.test(n) || n.startsWith(".")) throw new Error(`Invalid file name: ${n}`);
-  return path.join(DIR, `${n}.md`);
+  const err = pathError(String(p));
+  if (err) throw new Error(err);
+  return path.join(DIR, ...p.split("/"));
 }
+const fileOf = (name: string) => `${dirOf(name)}.md`;
 
-// ponytail: returns every file with its content in one call; lazy-load content if the vault gets big.
-export async function listFiles(): Promise<FileDoc[]> {
+// Relative "/"-separated paths of everything under data/, skipping hidden entries like .git.
+async function walk() {
   assertDisk();
   await mkdir(DIR, { recursive: true });
-  const names = (await readdir(DIR)).filter((f) => f.endsWith(".md"));
+  return (await readdir(DIR, { recursive: true, withFileTypes: true }))
+    .map((e) => ({ e, rel: path.relative(DIR, path.join(e.parentPath, e.name)).split(path.sep).join("/") }))
+    .filter(({ rel }) => !rel.split("/").some((seg) => seg.startsWith(".")));
+}
+
+// returns every file with its content in one call; lazy-load content if the vault gets big.
+export async function listFiles(): Promise<FileDoc[]> {
+  const files = (await walk()).filter(({ e, rel }) => e.isFile() && rel.endsWith(".md"));
   return Promise.all(
-    names.map(async (f) => {
-      const p = path.join(DIR, f);
+    files.map(async ({ rel }) => {
+      const p = path.join(DIR, rel);
       const [content, s] = await Promise.all([readFile(p, "utf8"), stat(p)]);
-      return { name: f.slice(0, -3), content, updatedAt: s.mtimeMs };
+      return { name: rel.slice(0, -3), content, updatedAt: s.mtimeMs };
     }),
   );
 }
 
-/** Creates a new file; fails if it already exists. */
+export async function listFolders(): Promise<string[]> {
+  return (await walk()).filter(({ e }) => e.isDirectory()).map(({ rel }) => rel);
+}
+
+export async function createFolder(p: string) {
+  await mkdir(dirOf(p), { recursive: true });
+}
+
+/** Deletes a folder with everything inside it, and their highlights. */
+export async function deleteFolder(p: string) {
+  await rm(dirOf(p), { recursive: true, force: true });
+  await editHighlights((all) => Object.keys(all).forEach((k) => isInside(k, p) && delete all[k]));
+}
+
+/** Creates a new file (and its folders); fails if it already exists. */
 export async function createFile(name: string, content: string) {
-  await mkdir(DIR, { recursive: true });
-  await writeFile(fileOf(name), content, { flag: "wx" });
+  const f = fileOf(name);
+  await mkdir(path.dirname(f), { recursive: true });
+  await writeFile(f, content, { flag: "wx" });
 }
 
 export async function saveFile(name: string, content: string) {
@@ -61,6 +85,7 @@ export async function saveFile(name: string, content: string) {
 
 /** Renames and writes the latest content in one step, so no unsaved edit is lost. */
 export async function renameFile(from: string, to: string, content: string) {
+  await mkdir(path.dirname(fileOf(to)), { recursive: true });
   await writeFile(fileOf(to), content, { flag: "wx" }); // fails if target exists
   await unlink(fileOf(from)).catch(() => {});
   await editHighlights((all) => {

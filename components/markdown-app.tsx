@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useRef, useState, type DragEvent, type UIEvent } from "react";
+import { useEffect, useRef, useState, type DragEvent, type ReactNode, type UIEvent } from "react";
 import {
-  BookOpen, BookOpenText, Check, ChevronDown, Clipboard, Clock, Columns2, Download, Eye, FilePlus, FileUp, FolderUp,
+  BookOpen, BookOpenText, Check, ChevronDown, ChevronRight, Clipboard, Clock, Columns2, Download, Eye, FilePlus, FileUp,
+  Folder, FolderOpen, FolderPlus, FolderUp,
   MoreVertical, PanelLeft, Pencil, Pilcrow, Plus, Search, Star, Trash2, Type, X,
 } from "lucide-react";
 import { Editor } from "@/components/editor";
@@ -23,13 +24,17 @@ import {
 import { cn } from "@/lib/utils";
 import type { Highlight } from "@/app/actions";
 import { browserStore, pickStore, type Store } from "@/lib/storage";
+import { baseName, buildTree, dirName, isInside, joinPath, pathError, type TreeNode } from "@/lib/paths";
 import { Reader } from "@/components/reader";
 
-// id === file name (data/<name>.md); file contents live on disk, only UI state lives in localStorage.
+// id === name === path without .md, e.g. "plan/api" (data/plan/api.md on disk).
 type Doc = { id: string; name: string; content: string; updatedAt: number; fav?: boolean };
 type State = { docs: Doc[]; openIds: string[]; activeId: string | null };
 type Ui = { openIds: string[]; activeId: string | null; favs: string[] };
 type View = "edit" | "split" | "preview" | "read";
+type Picked = { file: File; path: string }; // an imported file and its path inside the picked/dropped folder
+type DeleteTarget = { kind: "file"; doc: Doc } | { kind: "folder"; path: string; count: number };
+const DRAG_TYPE = "text/x-md-path"; // internal drag of a file onto a folder (move)
 
 const UI_KEY = "md-viewer:ui";
 
@@ -63,12 +68,17 @@ function download(filename: string, text: string, type: string) {
 
 const stripExt = (n: string) => n.replace(/\.(md|markdown|txt)$/i, "");
 
-// Dropped items can be folders: walk them recursively to get every file inside.
-function filesFromDrop(dt: DataTransfer): Promise<File[]> {
-  const walk = async (entry: FileSystemEntry | File | null): Promise<File[]> => {
-    if (entry instanceof File) return [entry];
+// Dropped items can be folders: walk them recursively to get every file inside, keeping its folder path.
+const fromInput = (files: FileList): Picked[] => [...files].map((file) => ({ file, path: file.webkitRelativePath || file.name }));
+
+function filesFromDrop(dt: DataTransfer): Promise<Picked[]> {
+  const walk = async (entry: FileSystemEntry | File | null): Promise<Picked[]> => {
+    if (entry instanceof File) return [{ file: entry, path: entry.name }];
     if (!entry || entry.name.startsWith(".")) return [];
-    if (entry.isFile) return [await new Promise<File>((res, rej) => (entry as FileSystemFileEntry).file(res, rej))];
+    if (entry.isFile) {
+      const file = await new Promise<File>((res, rej) => (entry as FileSystemFileEntry).file(res, rej));
+      return [{ file, path: entry.fullPath.replace(/^\//, "") }]; // "/plan/api.md" → "plan/api.md"
+    }
     const reader = (entry as FileSystemDirectoryEntry).createReader();
     const entries: FileSystemEntry[] = [];
     // readEntries returns batches (Chrome: ≤100) until an empty one
@@ -95,7 +105,12 @@ export default function MarkdownApp() {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
   const [renaming, setRenaming] = useState<string | null>(null);
-  const [toDelete, setToDelete] = useState<Doc | null>(null);
+  const [toDelete, setToDelete] = useState<DeleteTarget | null>(null);
+  const [folders, setFolders] = useState<string[]>([]); // explicit folders (may be empty); others come from file paths
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [draftFolderIn, setDraftFolderIn] = useState<string | null>(null); // parent path showing a "new folder" input
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const importDir = useRef(""); // folder that the next upload goes into ("" = top level)
   const [dragging, setDragging] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const folderInput = useRef<HTMLInputElement>(null);
@@ -111,8 +126,9 @@ export default function MarkdownApp() {
       const picked = await pickStore();
       store.current = picked.store;
       setStorageKind(picked.kind);
-      const [files, hl] = await Promise.all([store.current.listFiles(), store.current.getHighlights()]);
+      const [files, dirs, hl] = await Promise.all([store.current.listFiles(), store.current.listFolders(), store.current.getHighlights()]);
       setHl(hl);
+      setFolders(dirs);
       const docs: Doc[] = files.map((f) => ({ ...f, id: f.name, fav: ui.favs.includes(f.name) }));
       const ids = new Set(docs.map((d) => d.id));
       const openIds = ui.openIds.filter((id) => ids.has(id));
@@ -189,9 +205,50 @@ export default function MarkdownApp() {
     return made;
   };
 
-  const create = async () => {
-    const [d] = await createDocs([{ name: "Untitled", content: "# Untitled\n\n" }]);
+  // Un-collapse a folder and all its parents.
+  const expand = (dir: string) =>
+    setCollapsed((c) => {
+      const next = new Set(c);
+      for (let p = dir; p; p = dirName(p)) next.delete(p);
+      return next;
+    });
+  const toggle = (dir: string) =>
+    setCollapsed((c) => {
+      const next = new Set(c);
+      if (!next.delete(dir)) next.add(dir);
+      return next;
+    });
+
+  const create = async (dir = "") => {
+    expand(dir);
+    const [d] = await createDocs([{ name: joinPath(dir, "Untitled"), content: "# Untitled\n\n" }]);
     if (d) setRenaming(d.id);
+  };
+
+  const folderExists = (p: string) => folders.includes(p) || docs.some((d) => isInside(d.name, p));
+  const startFolder = (parent: string) => {
+    expand(parent);
+    setDraftFolderIn(parent);
+  };
+  const addFolder = async (parent: string, input: string) => {
+    setDraftFolderIn(null);
+    const name = input.trim();
+    if (!name) return;
+    const p = joinPath(parent, name);
+    const err = name.includes("/") ? "Folder names can't contain /." : pathError(p);
+    if (err) return alert(err);
+    if (folderExists(p)) return alert(`Folder "${p}" already exists.`);
+    try {
+      await store.current.createFolder(p);
+    } catch (e) {
+      return alert(`Could not create folder: ${errMsg(e)}`);
+    }
+    setFolders((f) => [...f, p]);
+  };
+
+  const upload = (dir: string, kind: "files" | "folder") => {
+    importDir.current = dir;
+    (kind === "files" ? fileInput : folderInput).current?.click();
   };
 
   const close = (id: string) =>
@@ -201,23 +258,26 @@ export default function MarkdownApp() {
       return { ...s, openIds, activeId: s.activeId === id ? (openIds[Math.max(0, i - 1)] ?? null) : s.activeId };
     });
 
-  // Every delete goes through the confirm dialog: remove() only asks, confirmRemove() deletes.
-  const remove = (d: Doc) => setToDelete(d);
-  const confirmRemove = async (d: Doc) => {
+  // Every delete goes through the confirm dialog: remove()/removeFolder() only ask, confirmRemove() deletes.
+  const remove = (d: Doc) => setToDelete({ kind: "file", doc: d });
+  const removeFolder = (path: string) =>
+    setToDelete({ kind: "folder", path, count: docs.filter((d) => isInside(d.name, path)).length });
+  const confirmRemove = async (t: DeleteTarget) => {
     setToDelete(null);
+    const gone = (name: string) => (t.kind === "file" ? name === t.doc.name : isInside(name, t.path));
     try {
-      pending.current.delete(d.name);
-      await store.current.deleteFile(d.name);
+      for (const n of [...pending.current.keys()]) if (gone(n)) pending.current.delete(n);
+      if (t.kind === "file") await store.current.deleteFile(t.doc.name);
+      else await store.current.deleteFolder(t.path);
     } catch (e) {
       return alert(`Could not delete: ${errMsg(e)}`);
     }
-    close(d.id);
-    update((s) => ({ ...s, docs: s.docs.filter((x) => x.id !== d.id) }));
-    setHl((h) => { // server already dropped them
-      const rest = { ...h };
-      delete rest[d.name];
-      return rest;
+    update((s) => {
+      const openIds = s.openIds.filter((id) => !gone(id));
+      return { docs: s.docs.filter((d) => !gone(d.name)), openIds, activeId: s.activeId && gone(s.activeId) ? (openIds[0] ?? null) : s.activeId };
     });
+    if (t.kind === "folder") setFolders((f) => f.filter((p) => p !== t.path && !isInside(p, t.path)));
+    setHl((h) => Object.fromEntries(Object.entries(h).filter(([k]) => !gone(k)))); // store already dropped them
   };
 
   const saveHighlights = (name: string, list: Highlight[]) => {
@@ -225,12 +285,19 @@ export default function MarkdownApp() {
     store.current.setHighlights(name, list).catch((e) => alert(`Could not save highlight: ${errMsg(e)}`));
   };
 
-  const rename = async (d: Doc, input: string) => {
+  const rename = (d: Doc, input: string) => {
     setRenaming(null);
-    const to = stripExt(input.trim());
-    if (!to || to === d.name) return;
-    // Mirrors the server check in app/actions.ts (the server stays the real guard).
-    if (/[/\\\0:*?"<>|]/.test(to) || to.startsWith(".")) return alert(`Invalid name. Don't use / \\ : * ? " < > | or a leading dot.`);
+    const base = stripExt(input.trim());
+    if (!base) return;
+    if (base.includes("/")) return alert("Names can't contain /. Drag the file onto a folder to move it.");
+    move(d, joinPath(dirName(d.name), base));
+  };
+
+  // Rename and move are the same operation: give the file a new path.
+  const move = async (d: Doc, to: string) => {
+    if (to === d.name) return;
+    const err = pathError(to); // mirrors the server check (the server stays the real guard)
+    if (err) return alert(err);
     if (docs.some((x) => x !== d && x.name.toLowerCase() === to.toLowerCase())) return alert(`"${to}" already exists.`);
     try {
       clearTimeout(saveTimer.current);
@@ -248,21 +315,27 @@ export default function MarkdownApp() {
     setHl(({ [d.name]: list, ...rest }) => (list ? { ...rest, [to]: list } : rest)); // server already moved them
   };
 
-  // Accepts loose files or a whole folder (from the folder picker or a drop); keeps only markdown,
-  // skipping anything inside hidden folders like .git.
-  const importFiles = async (files: FileList | File[]) => {
-    const md = [...files].filter(
-      (f) => /\.(md|markdown)$/i.test(f.name) && !(f.webkitRelativePath || f.name).split("/").some((p) => p.startsWith(".")),
+  // Accepts loose files or whole folders (picker or drop) and keeps their folder structure, e.g. plan/api.md.
+  // Only markdown is kept; anything inside hidden folders like .git is skipped.
+  const importFiles = async (items: Picked[]) => {
+    const dir = importDir.current;
+    importDir.current = "";
+    const md = items.filter(({ path }) => /\.(md|markdown)$/i.test(path) && !path.split("/").some((p) => p.startsWith(".")));
+    if (!md.length) return items.length && alert("No .md files found.");
+    const all = await Promise.all(
+      md.map(async ({ file, path }) => ({ name: joinPath(dir, path.replace(/\.(md|markdown)$/i, "")), content: await file.text() })),
     );
-    if (!md.length) return files.length && alert("No .md files found.");
-    await createDocs(await Promise.all(md.map(async (f) => ({ name: stripExt(f.name), content: await f.text() }))));
+    const ok = all.filter((it) => !pathError(it.name));
+    if (ok.length < all.length) alert(`Skipped ${all.length - ok.length} file(s) with unsupported names.`);
+    expand(dir);
+    await createDocs(ok);
   };
 
   const exportHtml = async (d: Doc) => {
     const { renderToStaticMarkup } = await import("react-dom/server");
     const body = renderToStaticMarkup(<Preview content={d.content} />);
     const html = `<!doctype html><html><head><meta charset="utf-8"><title>${d.name}</title><style>body{font-family:system-ui,sans-serif;max-width:800px;margin:auto;line-height:1.6}pre{background:#f6f8fa;padding:1rem;overflow:auto}table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:.4rem .8rem}button{display:none}</style></head><body>${body}</body></html>`;
-    download(`${d.name}.html`, html, "text/html");
+    download(`${baseName(d.name)}.html`, html, "text/html");
   };
 
   // ponytail: proportional sync scroll, one-way (editor → preview). Line-anchored sync if it drifts on long docs.
@@ -278,12 +351,138 @@ export default function MarkdownApp() {
     importFiles(await filesFromDrop(e.dataTransfer));
   };
 
+  // Internal drag: drop a file onto a folder (or the empty list area = top level) to move it there.
+  const onTreeDragOver = (e: DragEvent, dir: string) => {
+    if (!e.dataTransfer.types.includes(DRAG_TYPE)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setDropTarget(dir);
+  };
+  const onTreeDrop = (e: DragEvent, dir: string) => {
+    if (!e.dataTransfer.types.includes(DRAG_TYPE)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setDropTarget(null);
+    const d = docs.find((x) => x.id === e.dataTransfer.getData(DRAG_TYPE));
+    if (d && dirName(d.name) !== dir) {
+      expand(dir);
+      move(d, joinPath(dir, baseName(d.name)));
+    }
+  };
+
+  const byId = new Map(docs.map((d) => [d.id, d]));
+  const tree = buildTree(docs.map((d) => d.name), folders);
+  const countFiles = (n: TreeNode): number => n.files.length + n.folders.reduce((sum, f) => sum + countFiles(f), 0);
+  const flat = filter !== "all" || !!query; // search / Recent / Favs show a flat list with folder paths
   const listed = docs
     .filter((d) => d.name.toLowerCase().includes(query.toLowerCase()))
     .filter((d) => filter !== "favs" || d.fav)
     .sort((a, b) => (filter === "recent" ? b.updatedAt - a.updatedAt : a.name.localeCompare(b.name)));
 
   const words = active?.content.trim().split(/\s+/).filter(Boolean).length ?? 0;
+
+  const indent = (depth: number) => ({ paddingLeft: 8 + depth * 14 });
+
+  const fileRow = (d: Doc, depth: number, showDir = false) => (
+    <li key={d.id} draggable={renaming !== d.id} style={indent(depth)}
+      onDragStart={(e) => {
+        e.dataTransfer.setData(DRAG_TYPE, d.id);
+        e.dataTransfer.effectAllowed = "move";
+      }}
+      onDragEnd={() => setDropTarget(null)}
+      className={cn("group flex items-center gap-2 rounded-md py-1.5 pr-1 text-sm hover:bg-accent/60", d.id === activeId && "bg-accent")}>
+      <BookOpen className="ml-5 size-4 shrink-0 text-sky-600 dark:text-sky-400" />
+      {renaming === d.id ? (
+        <input autoFocus defaultValue={baseName(d.name)} className="min-w-0 flex-1 rounded bg-background px-1 outline-none ring-1 ring-ring"
+          onFocus={(e) => e.target.select()}
+          onBlur={(e) => rename(d, e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.currentTarget.blur();
+            if (e.key === "Escape") setRenaming(null);
+          }} />
+      ) : (
+        <button className="min-w-0 flex-1 truncate text-left" title={d.name} onClick={() => open(d.id)} onDoubleClick={() => setRenaming(d.id)}>
+          {baseName(d.name)}
+          {showDir && dirName(d.name) && <span className="ml-1.5 text-xs text-muted-foreground">{dirName(d.name)}</span>}
+        </button>
+      )}
+      {d.fav && <Star className="size-3.5 shrink-0 fill-yellow-400 text-yellow-400" />}
+      <DropdownMenu>
+        <DropdownMenuTrigger render={<Button variant="ghost" size="icon-xs" aria-label="File actions" className="opacity-0 group-hover:opacity-100 data-popup-open:opacity-100" />}>
+          <MoreVertical />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start">
+          <DropdownMenuItem onClick={() => setRenaming(d.id)}>Rename</DropdownMenuItem>
+          <DropdownMenuItem onClick={() => patch(d.id, { fav: !d.fav })}>{d.fav ? "Unfavorite" : "Favorite"}</DropdownMenuItem>
+          <DropdownMenuItem onClick={() => download(`${baseName(d.name)}.md`, d.content, "text/markdown")}>Download .md</DropdownMenuItem>
+          {dirName(d.name) && <DropdownMenuItem onClick={() => move(d, baseName(d.name))}>Move to top level</DropdownMenuItem>}
+          <DropdownMenuSeparator />
+          <DropdownMenuItem variant="destructive" onClick={() => remove(d)}>Delete</DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </li>
+  );
+
+  // Inline "new folder" name input, shown inside `parent`.
+  const draftRow = (parent: string, depth: number) =>
+    draftFolderIn === parent && (
+      <li key={`draft:${parent}`} style={indent(depth)} className="flex items-center gap-1.5 py-1 pr-1 text-sm">
+        <Folder className="ml-5 size-4 shrink-0 text-amber-500" />
+        <input autoFocus placeholder="Folder name" aria-label="New folder name"
+          className="min-w-0 flex-1 rounded bg-background px-1 outline-none ring-1 ring-ring"
+          onBlur={(e) => addFolder(parent, e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.currentTarget.blur();
+            if (e.key === "Escape") setDraftFolderIn(null);
+          }} />
+      </li>
+    );
+
+  const folderRow = (n: TreeNode, depth: number): ReactNode => {
+    const isOpen = !collapsed.has(n.path);
+    return (
+      <li key={`dir:${n.path}`}>
+        <div style={indent(depth)}
+          onDragOver={(e) => onTreeDragOver(e, n.path)}
+          onDragLeave={() => setDropTarget(null)}
+          onDrop={(e) => onTreeDrop(e, n.path)}
+          className={cn("group flex items-center gap-1 rounded-md py-1 pr-1 text-sm hover:bg-accent/60",
+            dropTarget === n.path && "bg-sky-500/15 ring-1 ring-sky-500")}>
+          <button className="flex min-w-0 flex-1 items-center gap-1.5 py-0.5 text-left" aria-expanded={isOpen} title={n.path}
+            onClick={() => toggle(n.path)}>
+            <ChevronRight className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform", isOpen && "rotate-90")} />
+            {isOpen ? <FolderOpen className="size-4 shrink-0 text-amber-500" /> : <Folder className="size-4 shrink-0 text-amber-500" />}
+            <span className="truncate">{n.name}</span>
+          </button>
+          <span className="px-1.5 text-xs text-muted-foreground group-hover:hidden group-has-[[data-popup-open]]:hidden">{countFiles(n)}</span>
+          <div className="hidden items-center group-hover:flex group-has-[[data-popup-open]]:flex">
+            <IconBtn label="New file in folder" className="size-6" onClick={() => create(n.path)}><FilePlus /></IconBtn>
+            <IconBtn label="New subfolder" className="size-6" onClick={() => startFolder(n.path)}><FolderPlus /></IconBtn>
+            <DropdownMenu>
+              <DropdownMenuTrigger render={<Button variant="ghost" size="icon-xs" aria-label="Folder actions" />}>
+                <MoreVertical />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start">
+                <DropdownMenuItem onClick={() => create(n.path)}><FilePlus /> New file</DropdownMenuItem>
+                <DropdownMenuItem onClick={() => startFolder(n.path)}><FolderPlus /> New subfolder</DropdownMenuItem>
+                <DropdownMenuItem onClick={() => upload(n.path, "files")}><FileUp /> Upload files here</DropdownMenuItem>
+                <DropdownMenuItem onClick={() => upload(n.path, "folder")}><FolderUp /> Upload folder here</DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem variant="destructive" onClick={() => removeFolder(n.path)}><Trash2 /> Delete folder</DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </div>
+        {isOpen && (
+          <ul className="space-y-0.5">
+            {draftRow(n.path, depth + 1)}
+            {n.folders.map((f) => folderRow(f, depth + 1))}
+            {n.files.map((id) => fileRow(byId.get(id)!, depth + 1))}
+          </ul>
+        )}
+      </li>
+    );
+  };
 
   const editor = active && (
     <Editor
@@ -303,14 +502,18 @@ export default function MarkdownApp() {
   return (
     <div
       className="relative flex h-screen flex-col bg-background text-foreground"
-      onDragOver={(e) => (e.preventDefault(), setDragging(true))}
+      onDragOver={(e) => {
+        if (!e.dataTransfer.types.includes("Files")) return; // only OS files/folders, not internal moves
+        e.preventDefault();
+        setDragging(true);
+      }}
       onDragLeave={(e) => e.currentTarget === e.target && setDragging(false)}
       onDrop={onDrop}
     >
       <input ref={fileInput} type="file" accept=".md,.markdown,text/markdown" multiple hidden
-        onChange={(e) => (e.target.files && importFiles(e.target.files), (e.target.value = ""))} />
+        onChange={(e) => (e.target.files && importFiles(fromInput(e.target.files)), (e.target.value = ""))} />
       <input ref={folderInput} type="file" hidden {...{ webkitdirectory: "" }}
-        onChange={(e) => (e.target.files && importFiles(e.target.files), (e.target.value = ""))} />
+        onChange={(e) => (e.target.files && importFiles(fromInput(e.target.files)), (e.target.value = ""))} />
 
       {/* Header */}
       <header className="flex h-14 shrink-0 items-center gap-3 border-b px-4">
@@ -325,16 +528,16 @@ export default function MarkdownApp() {
             <IconBtn label="Preview only" active={view === "preview"} onClick={() => setView("preview")}><Eye /></IconBtn>
             <IconBtn label="Read mode (select text to highlight)" active={view === "read"} onClick={() => setView("read")}><BookOpenText /></IconBtn>
           </div>
-          <IconBtn label="New file" onClick={create} className="border"><Plus /></IconBtn>
-          <IconBtn label="Open .md file" onClick={() => fileInput.current?.click()} className="border"><FileUp /></IconBtn>
-          <IconBtn label="Open folder of .md files" onClick={() => folderInput.current?.click()} className="border"><FolderUp /></IconBtn>
+          <IconBtn label="New file" onClick={() => create()} className="border"><Plus /></IconBtn>
+          <IconBtn label="Open .md file" onClick={() => upload("", "files")} className="border"><FileUp /></IconBtn>
+          <IconBtn label="Open folder of .md files" onClick={() => upload("", "folder")} className="border"><FolderUp /></IconBtn>
           <IconBtn label="Copy markdown" disabled={!active} onClick={() => active && navigator.clipboard.writeText(active.content)} className="border"><Clipboard /></IconBtn>
           <DropdownMenu>
             <DropdownMenuTrigger render={<Button variant="ghost" size="sm" disabled={!active} className="border text-muted-foreground" />}>
               <Download /> <ChevronDown className="size-3" />
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              <DropdownMenuItem onClick={() => active && download(`${active.name}.md`, active.content, "text/markdown")}>Markdown (.md)</DropdownMenuItem>
+              <DropdownMenuItem onClick={() => active && download(`${baseName(active.name)}.md`, active.content, "text/markdown")}>Markdown (.md)</DropdownMenuItem>
               <DropdownMenuItem onClick={() => active && exportHtml(active)}>HTML (.html)</DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -345,13 +548,14 @@ export default function MarkdownApp() {
       <div className="flex min-h-0 flex-1">
         {/* Sidebar */}
         {sidebar && view !== "read" && (
-          <aside className="flex w-64 shrink-0 flex-col border-r">
+          <aside className="flex w-72 shrink-0 flex-col border-r">
             <div className="flex h-11 items-center border-b px-3">
               <span className="text-sm font-semibold">Explorer</span>
               <div className="ml-auto flex">
-                <IconBtn label="New file" onClick={create}><FilePlus /></IconBtn>
-                <IconBtn label="Open file" onClick={() => fileInput.current?.click()}><FileUp /></IconBtn>
-                <IconBtn label="Open folder" onClick={() => folderInput.current?.click()}><FolderUp /></IconBtn>
+                <IconBtn label="New file" onClick={() => create()}><FilePlus /></IconBtn>
+                <IconBtn label="New folder" onClick={() => startFolder("")}><FolderPlus /></IconBtn>
+                <IconBtn label="Upload files" onClick={() => upload("", "files")}><FileUp /></IconBtn>
+                <IconBtn label="Upload folder" onClick={() => upload("", "folder")}><FolderUp /></IconBtn>
                 <IconBtn label="Delete active file" disabled={!active} onClick={() => active && remove(active)}><Trash2 /></IconBtn>
               </div>
             </div>
@@ -368,43 +572,31 @@ export default function MarkdownApp() {
                 </TabsList>
               </Tabs>
             </div>
-            <div className="px-3 pb-1 text-[11px] font-semibold tracking-wider text-muted-foreground">FILES</div>
-            <ul className="flex-1 space-y-0.5 overflow-auto px-2">
-              {listed.map((d) => (
-                <li key={d.id}
-                  className={cn("group flex items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-accent/60", d.id === activeId && "bg-accent")}>
-                  <BookOpen className="size-4 shrink-0 text-sky-600 dark:text-sky-400" />
-                  {renaming === d.id ? (
-                    <input autoFocus defaultValue={d.name} className="min-w-0 flex-1 rounded bg-background px-1 outline-none ring-1 ring-ring"
-                      onFocus={(e) => e.target.select()}
-                      onBlur={(e) => rename(d, e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") e.currentTarget.blur();
-                        if (e.key === "Escape") setRenaming(null);
-                      }} />
-                  ) : (
-                    <button className="min-w-0 flex-1 truncate text-left" onClick={() => open(d.id)} onDoubleClick={() => setRenaming(d.id)}>
-                      {d.name}
-                    </button>
-                  )}
-                  {d.fav && <Star className="size-3.5 shrink-0 fill-yellow-400 text-yellow-400" />}
-                  <DropdownMenu>
-                    <DropdownMenuTrigger render={<Button variant="ghost" size="icon-xs" aria-label="File actions" className="opacity-0 group-hover:opacity-100 data-popup-open:opacity-100" />}>
-                      <MoreVertical />
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="start">
-                      <DropdownMenuItem onClick={() => setRenaming(d.id)}>Rename</DropdownMenuItem>
-                      <DropdownMenuItem onClick={() => patch(d.id, { fav: !d.fav })}>{d.fav ? "Unfavorite" : "Favorite"}</DropdownMenuItem>
-                      <DropdownMenuItem onClick={() => download(`${d.name}.md`, d.content, "text/markdown")}>Download .md</DropdownMenuItem>
-                      <DropdownMenuSeparator />
-                      <DropdownMenuItem variant="destructive" onClick={() => remove(d)}>Delete</DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </li>
-              ))}
-              {!listed.length && <li className="px-2 py-4 text-center text-xs text-muted-foreground">No files</li>}
+            <div className="flex items-baseline justify-between px-3 pb-1 text-[11px] font-semibold tracking-wider text-muted-foreground">
+              FILES {!flat && <span className="font-normal tracking-normal">Drag files onto a folder to move</span>}
+            </div>
+            <ul
+              className={cn("flex-1 space-y-0.5 overflow-auto px-2 pb-4", dropTarget === "" && "bg-sky-500/5 ring-1 ring-inset ring-sky-500")}
+              onDragOver={(e) => onTreeDragOver(e, "")}
+              onDragLeave={(e) => e.currentTarget === e.target && setDropTarget(null)}
+              onDrop={(e) => onTreeDrop(e, "")}
+            >
+              {flat ? (
+                listed.map((d) => fileRow(d, 0, true))
+              ) : (
+                <>
+                  {draftRow("", 0)}
+                  {tree.folders.map((f) => folderRow(f, 0))}
+                  {tree.files.map((id) => fileRow(byId.get(id)!, 0))}
+                </>
+              )}
+              {(flat ? !listed.length : !docs.length && !tree.folders.length && draftFolderIn === null) && (
+                <li className="px-2 py-4 text-center text-xs text-muted-foreground">No files</li>
+              )}
             </ul>
-            <div className="border-t px-3 py-2 text-xs text-muted-foreground">{docs.length} file{docs.length === 1 ? "" : "s"}</div>
+            <div className="border-t px-3 py-2 text-xs text-muted-foreground">
+              {docs.length} file{docs.length === 1 ? "" : "s"}
+            </div>
           </aside>
         )}
 
@@ -422,14 +614,14 @@ export default function MarkdownApp() {
                   className={cn("group flex max-w-52 cursor-pointer items-center gap-2 border-r px-3 text-sm text-muted-foreground",
                     d.id === activeId && "border-b-2 border-b-sky-500 bg-accent/40 text-sky-600 dark:text-sky-400")}>
                   <BookOpen className="size-4 shrink-0" />
-                  <span className="truncate">{d.name}</span>
-                  <button aria-label={`Close ${d.name}`} className="rounded p-0.5 opacity-60 hover:bg-accent hover:opacity-100"
+                  <span className="truncate" title={d.name}>{baseName(d.name)}</span>
+                  <button aria-label={`Close ${baseName(d.name)}`} className="rounded p-0.5 opacity-60 hover:bg-accent hover:opacity-100"
                     onClick={(e) => (e.stopPropagation(), close(d.id))}><X className="size-3.5" /></button>
                 </div>
               ))}
             </div>
             <div className="flex items-center border-l px-2">
-              <IconBtn label="New file" onClick={create}><Plus /></IconBtn>
+              <IconBtn label="New file" onClick={() => create()}><Plus /></IconBtn>
             </div>
           </div>
 
@@ -440,9 +632,9 @@ export default function MarkdownApp() {
               <div className="flex h-full flex-col items-center justify-center gap-3 text-muted-foreground">
                 <p>No file open. Create one, or drop .md files or a folder here.</p>
                 <div className="flex gap-2">
-                  <Button onClick={create}><Plus /> New file</Button>
-                  <Button variant="outline" onClick={() => fileInput.current?.click()}><FileUp /> Open file</Button>
-                  <Button variant="outline" onClick={() => folderInput.current?.click()}><FolderUp /> Open folder</Button>
+                  <Button onClick={() => create()}><Plus /> New file</Button>
+                  <Button variant="outline" onClick={() => upload("", "files")}><FileUp /> Open file</Button>
+                  <Button variant="outline" onClick={() => upload("", "folder")}><FolderUp /> Open folder</Button>
                 </div>
               </div>
             ) : view === "split" ? (
@@ -474,11 +666,16 @@ export default function MarkdownApp() {
       <AlertDialog open={!!toDelete} onOpenChange={(o) => !o && setToDelete(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete &ldquo;{toDelete?.name}&rdquo;?</AlertDialogTitle>
+            <AlertDialogTitle>
+              Delete {toDelete?.kind === "folder" ? "folder " : ""}&ldquo;{toDelete && (toDelete.kind === "file" ? baseName(toDelete.doc.name) : toDelete.path)}&rdquo;?
+            </AlertDialogTitle>
             <AlertDialogDescription>
-              {storageKind === "disk"
-                ? <>This permanently deletes <code>data/{toDelete?.name}.md</code> from disk.</>
-                : <>This permanently deletes it from this browser. Download it first if you want a copy.</>}{" "}
+              {toDelete?.kind === "folder"
+                ? <>This permanently deletes the folder and the {toDelete.count} file{toDelete.count === 1 ? "" : "s"} inside it{" "}
+                    {storageKind === "disk" ? <>(<code>data/{toDelete.path}/</code>) from disk.</> : "from this browser."}</>
+                : storageKind === "disk"
+                  ? <>This permanently deletes <code>data/{toDelete?.kind === "file" && toDelete.doc.name}.md</code> from disk.</>
+                  : <>This permanently deletes it from this browser. Download it first if you want a copy.</>}{" "}
               This cannot be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>

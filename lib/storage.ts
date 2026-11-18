@@ -6,11 +6,14 @@ import type { FileDoc, Highlight } from "@/app/actions";
 // One interface, two backends: data/ on disk (local server) or IndexedDB in the visitor's browser (deployed).
 export type Store = Pick<
   typeof disk,
-  "listFiles" | "createFile" | "saveFile" | "renameFile" | "deleteFile" | "getHighlights" | "setHighlights"
+  | "listFiles" | "createFile" | "saveFile" | "renameFile" | "deleteFile" | "getHighlights" | "setHighlights"
+  | "listFolders" | "createFolder" | "deleteFolder"
 >;
 
-// Each file is one IndexedDB record; its highlights ride along, so rename/delete carry them for free.
-type Rec = FileDoc & { highlights?: Highlight[] };
+// Each file is one IndexedDB record keyed by its path; its highlights ride along, so rename/delete carry them.
+// Explicit folders are records keyed "path/" (a trailing slash never collides with a file path).
+type Rec = FileDoc & { highlights?: Highlight[]; folder?: true };
+const files = (all: Rec[]) => all.filter((r) => !r.folder);
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 const db = () =>
@@ -44,7 +47,20 @@ const missing = (name: string) => new Error(`"${name}" not found.`);
 
 export const browserStore: Store = {
   listFiles: () =>
-    tx("readonly", async (s) => (await req<Rec[]>(s.getAll())).map(({ name, content, updatedAt }) => ({ name, content, updatedAt }))),
+    tx("readonly", async (s) => files(await req<Rec[]>(s.getAll())).map(({ name, content, updatedAt }) => ({ name, content, updatedAt }))),
+
+  listFolders: () =>
+    tx("readonly", async (s) => (await req<Rec[]>(s.getAll())).filter((r) => r.folder).map((r) => r.name.slice(0, -1))),
+
+  createFolder: (p) =>
+    tx("readwrite", async (s) => void (await req(s.put({ name: `${p}/`, content: "", updatedAt: Date.now(), folder: true } satisfies Rec)))),
+
+  deleteFolder: (p) =>
+    tx("readwrite", async (s) => {
+      // "p/" is the folder record itself; "p/..." are its files and subfolders
+      const keys = (await req(s.getAllKeys())).filter((k) => String(k).startsWith(`${p}/`));
+      await Promise.all(keys.map((k) => req(s.delete(k))));
+    }),
 
   createFile: (name, content) =>
     tx("readwrite", async (s) => void (await req(s.add({ name, content, updatedAt: Date.now() } satisfies Rec)))), // add() fails if it exists
@@ -67,7 +83,7 @@ export const browserStore: Store = {
 
   getHighlights: () =>
     tx("readonly", async (s) =>
-      Object.fromEntries((await req<Rec[]>(s.getAll())).filter((r) => r.highlights?.length).map((r) => [r.name, r.highlights!])),
+      Object.fromEntries(files(await req<Rec[]>(s.getAll())).filter((r) => r.highlights?.length).map((r) => [r.name, r.highlights!])),
     ),
 
   setHighlights: (name, list) =>
