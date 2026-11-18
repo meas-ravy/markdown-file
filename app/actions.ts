@@ -1,6 +1,6 @@
 "use server";
 
-import { mkdir, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { isInside, pathError } from "@/lib/paths";
 
@@ -70,6 +70,24 @@ export async function createFolder(p: string) {
 export async function deleteFolder(p: string) {
   await rm(dirOf(p), { recursive: true, force: true });
   await editHighlights((all) => Object.keys(all).forEach((k) => isInside(k, p) && delete all[k]));
+}
+
+/** Renames/moves a folder with everything inside it; its files' highlights move along. */
+export async function renameFolder(from: string, to: string) {
+  const src = dirOf(from), dst = dirOf(to);
+  if (to === from || isInside(to, from)) throw new Error("Can't move a folder into itself.");
+  // A case-only rename (plan → Plan) points at the same folder on case-insensitive disks, so skip the clash check.
+  const caseOnly = to.toLowerCase() === from.toLowerCase();
+  if (!caseOnly && (await stat(dst).then(() => true, () => false))) throw new Error(`"${to}" already exists.`);
+  await mkdir(path.dirname(dst), { recursive: true });
+  await rename(src, dst);
+  await editHighlights((all) => {
+    for (const k of Object.keys(all)) {
+      if (!isInside(k, from)) continue;
+      all[to + k.slice(from.length)] = all[k];
+      delete all[k];
+    }
+  });
 }
 
 /** Creates a new file (and its folders); fails if it already exists. */

@@ -7,7 +7,7 @@ import type { FileDoc, Highlight } from "@/app/actions";
 export type Store = Pick<
   typeof disk,
   | "listFiles" | "createFile" | "saveFile" | "renameFile" | "deleteFile" | "getHighlights" | "setHighlights"
-  | "listFolders" | "createFolder" | "deleteFolder"
+  | "listFolders" | "createFolder" | "deleteFolder" | "renameFolder"
 >;
 
 // Each file is one IndexedDB record keyed by its path; its highlights ride along, so rename/delete carry them.
@@ -60,6 +60,17 @@ export const browserStore: Store = {
       // "p/" is the folder record itself; "p/..." are its files and subfolders
       const keys = (await req(s.getAllKeys())).filter((k) => String(k).startsWith(`${p}/`));
       await Promise.all(keys.map((k) => req(s.delete(k))));
+    }),
+
+  renameFolder: (from, to) =>
+    tx("readwrite", async (s) => {
+      const all = await req<Rec[]>(s.getAll());
+      if (all.some((r) => r.name.startsWith(`${to}/`))) throw new Error(`"${to}" already exists.`);
+      // Re-key the folder record ("from/") and everything under it ("from/...").
+      for (const r of all.filter((r) => r.name.startsWith(`${from}/`))) {
+        await req(s.delete(r.name));
+        await req(s.put({ ...r, name: to + r.name.slice(from.length) }));
+      }
     }),
 
   createFile: (name, content) =>

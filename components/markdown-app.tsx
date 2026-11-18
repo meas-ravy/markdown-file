@@ -108,6 +108,7 @@ export default function MarkdownApp() {
   const [toDelete, setToDelete] = useState<DeleteTarget | null>(null);
   const [folders, setFolders] = useState<string[]>([]); // explicit folders (may be empty); others come from file paths
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [renamingFolder, setRenamingFolder] = useState<string | null>(null);
   const [draftFolderIn, setDraftFolderIn] = useState<string | null>(null); // parent path showing a "new folder" input
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   const importDir = useRef(""); // folder that the next upload goes into ("" = top level)
@@ -244,6 +245,33 @@ export default function MarkdownApp() {
       return alert(`Could not create folder: ${errMsg(e)}`);
     }
     setFolders((f) => [...f, p]);
+  };
+
+  // Renames a folder in place: every file, tab, favorite and highlight under it moves to the new path.
+  const renameFolder = async (from: string, input: string) => {
+    setRenamingFolder(null);
+    const name = input.trim();
+    if (!name || name === baseName(from)) return;
+    const to = joinPath(dirName(from), name);
+    const err = name.includes("/") ? "Folder names can't contain /." : pathError(to);
+    if (err) return alert(err);
+    if (folderExists(to) || docs.some((d) => d.name === to)) return alert(`"${to}" already exists.`);
+    try {
+      clearTimeout(saveTimer.current);
+      await flush(); // write pending edits first so a late save can't recreate the old path
+      await store.current.renameFolder(from, to);
+    } catch (e) {
+      return alert(`Could not rename folder: ${errMsg(e)}`);
+    }
+    const re = (p: string) => (p === from || isInside(p, from) ? to + p.slice(from.length) : p);
+    update((s) => ({
+      docs: s.docs.map((d) => (isInside(d.name, from) ? { ...d, id: re(d.id), name: re(d.name) } : d)),
+      openIds: s.openIds.map(re),
+      activeId: s.activeId && re(s.activeId),
+    }));
+    setFolders((f) => f.map(re));
+    setCollapsed((c) => new Set([...c].map(re)));
+    setHl((h) => Object.fromEntries(Object.entries(h).map(([k, v]) => [re(k), v])));
   };
 
   const upload = (dir: string, kind: "files" | "folder") => {
@@ -448,30 +476,48 @@ export default function MarkdownApp() {
           onDrop={(e) => onTreeDrop(e, n.path)}
           className={cn("group flex items-center gap-1 rounded-md py-1 pr-1 text-sm hover:bg-accent/60",
             dropTarget === n.path && "bg-sky-500/15 ring-1 ring-sky-500")}>
-          <button className="flex min-w-0 flex-1 items-center gap-1.5 py-0.5 text-left" aria-expanded={isOpen} title={n.path}
-            onClick={() => toggle(n.path)}>
-            <ChevronRight className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform", isOpen && "rotate-90")} />
-            {isOpen ? <FolderOpen className="size-4 shrink-0 text-amber-500" /> : <Folder className="size-4 shrink-0 text-amber-500" />}
-            <span className="truncate">{n.name}</span>
-          </button>
-          <span className="px-1.5 text-xs text-muted-foreground group-hover:hidden group-has-[[data-popup-open]]:hidden">{countFiles(n)}</span>
+          {renamingFolder === n.path ? (
+            <div className="flex min-w-0 flex-1 items-center gap-1.5 py-0.5">
+              <ChevronRight className={cn("size-3.5 shrink-0 text-muted-foreground", isOpen && "rotate-90")} />
+              <Folder className="size-4 shrink-0 text-amber-500" />
+              <input autoFocus defaultValue={n.name} aria-label="Folder name"
+                className="min-w-0 flex-1 rounded bg-background px-1 outline-none ring-1 ring-ring"
+                onFocus={(e) => e.target.select()}
+                onBlur={(e) => renameFolder(n.path, e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") e.currentTarget.blur();
+                  if (e.key === "Escape") setRenamingFolder(null);
+                }} />
+            </div>
+          ) : (
+            <button className="flex min-w-0 flex-1 items-center gap-1.5 py-0.5 text-left" aria-expanded={isOpen}
+              title={`${n.path} — double-click to rename`}
+              onClick={() => toggle(n.path)} onDoubleClick={() => setRenamingFolder(n.path)}>
+              <ChevronRight className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform", isOpen && "rotate-90")} />
+              {isOpen ? <FolderOpen className="size-4 shrink-0 text-amber-500" /> : <Folder className="size-4 shrink-0 text-amber-500" />}
+              <span className="truncate">{n.name}</span>
+            </button>
+          )}
+          <span className="px-1 text-xs text-muted-foreground group-hover:hidden group-has-[[data-popup-open]]:hidden">{countFiles(n)}</span>
           <div className="hidden items-center group-hover:flex group-has-[[data-popup-open]]:flex">
             <IconBtn label="New file in folder" className="size-6" onClick={() => create(n.path)}><FilePlus /></IconBtn>
             <IconBtn label="New subfolder" className="size-6" onClick={() => startFolder(n.path)}><FolderPlus /></IconBtn>
-            <DropdownMenu>
-              <DropdownMenuTrigger render={<Button variant="ghost" size="icon-xs" aria-label="Folder actions" />}>
-                <MoreVertical />
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="start">
+          </div>
+          {/* Always visible so rename/delete are easy to find. */}
+          <DropdownMenu>
+            <DropdownMenuTrigger render={<Button variant="ghost" size="icon-xs" aria-label="Folder actions" className="text-muted-foreground" />}>
+              <MoreVertical />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start">
+                <DropdownMenuItem onClick={() => setRenamingFolder(n.path)}><Pencil /> Rename folder</DropdownMenuItem>
+                <DropdownMenuItem variant="destructive" onClick={() => removeFolder(n.path)}><Trash2 /> Delete folder</DropdownMenuItem>
+                <DropdownMenuSeparator />
                 <DropdownMenuItem onClick={() => create(n.path)}><FilePlus /> New file</DropdownMenuItem>
                 <DropdownMenuItem onClick={() => startFolder(n.path)}><FolderPlus /> New subfolder</DropdownMenuItem>
                 <DropdownMenuItem onClick={() => upload(n.path, "files")}><FileUp /> Upload files here</DropdownMenuItem>
                 <DropdownMenuItem onClick={() => upload(n.path, "folder")}><FolderUp /> Upload folder here</DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem variant="destructive" onClick={() => removeFolder(n.path)}><Trash2 /> Delete folder</DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
         {isOpen && (
           <ul className="space-y-0.5">
