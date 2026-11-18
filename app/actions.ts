@@ -7,6 +7,17 @@ import path from "node:path";
 // so add auth before deploying anywhere others can reach it.
 const DIR = path.join(process.cwd(), "data");
 
+// Disk storage only where the server can write and isn't public: off on Vercel (read-only, public URL),
+// where the client stores files in the visitor's browser instead (lib/storage.ts).
+const DISK = !process.env.VERCEL;
+function assertDisk() {
+  if (!DISK) throw new Error("Disk storage is disabled on this deployment.");
+}
+
+export async function diskEnabled() {
+  return DISK;
+}
+
 export type FileDoc = { name: string; content: string; updatedAt: number };
 
 // Read-mode highlights live beside the files in one hidden JSON: { "<file name>": Highlight[] }.
@@ -18,6 +29,7 @@ const COLORS = ["yellow", "green", "blue", "pink"];
 
 // Trust boundary: names come from the client. Allow a plain file name only, never a path.
 function fileOf(name: string) {
+  assertDisk();
   const n = String(name).trim();
   if (!n || n.length > 200 || /[/\\\0:*?"<>|]/.test(n) || n.startsWith(".")) throw new Error(`Invalid file name: ${n}`);
   return path.join(DIR, `${n}.md`);
@@ -25,6 +37,7 @@ function fileOf(name: string) {
 
 // ponytail: returns every file with its content in one call; lazy-load content if the vault gets big.
 export async function listFiles(): Promise<FileDoc[]> {
+  assertDisk();
   await mkdir(DIR, { recursive: true });
   const names = (await readdir(DIR)).filter((f) => f.endsWith(".md"));
   return Promise.all(
@@ -78,6 +91,7 @@ async function editHighlights(fn: (all: Record<string, Highlight[]>) => void) {
 }
 
 export async function getHighlights() {
+  assertDisk();
   return readHighlights();
 }
 

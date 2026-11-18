@@ -21,7 +21,8 @@ import {
   AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { cn } from "@/lib/utils";
-import { createFile, deleteFile, getHighlights, listFiles, renameFile, saveFile, setHighlights, type Highlight } from "@/app/actions";
+import type { Highlight } from "@/app/actions";
+import { browserStore, pickStore, type Store } from "@/lib/storage";
 import { Reader } from "@/components/reader";
 
 // id === file name (data/<name>.md); file contents live on disk, only UI state lives in localStorage.
@@ -87,6 +88,8 @@ export default function MarkdownApp() {
   const pending = useRef(new Map<string, string>()); // file name → unsaved content
   const saveTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const [view, setView] = useState<View>("split");
+  const store = useRef<Store>(browserStore); // set on load: data/ on disk locally, this browser when deployed
+  const [storageKind, setStorageKind] = useState<"disk" | "browser">("browser");
   const [highlights, setHl] = useState<Record<string, Highlight[]>>({}); // file name → read-mode highlights
   const [sidebar, setSidebar] = useState(true);
   const [query, setQuery] = useState("");
@@ -105,7 +108,10 @@ export default function MarkdownApp() {
   // Load every .md file from data/ on the server. First run: empty, nothing is seeded.
   useEffect(() => {
     (async () => {
-      const [files, hl] = await Promise.all([listFiles(), getHighlights()]);
+      const picked = await pickStore();
+      store.current = picked.store;
+      setStorageKind(picked.kind);
+      const [files, hl] = await Promise.all([store.current.listFiles(), store.current.getHighlights()]);
       setHl(hl);
       const docs: Doc[] = files.map((f) => ({ ...f, id: f.name, fav: ui.favs.includes(f.name) }));
       const ids = new Set(docs.map((d) => d.id));
@@ -136,7 +142,7 @@ export default function MarkdownApp() {
     const batch = [...pending.current];
     pending.current.clear();
     try {
-      await Promise.all(batch.map(([name, content]) => saveFile(name, content)));
+      await Promise.all(batch.map(([name, content]) => store.current.saveFile(name, content)));
       setStatus(pending.current.size ? "saving" : "saved");
     } catch {
       for (const [n, c] of batch) if (!pending.current.has(n)) pending.current.set(n, c);
@@ -173,7 +179,7 @@ export default function MarkdownApp() {
     try {
       for (const it of items) {
         const d = newDoc(uniqueName(it.name, [...docs, ...made]), it.content);
-        await createFile(d.name, d.content);
+        await store.current.createFile(d.name, d.content);
         made.push(d);
       }
     } catch (e) {
@@ -201,7 +207,7 @@ export default function MarkdownApp() {
     setToDelete(null);
     try {
       pending.current.delete(d.name);
-      await deleteFile(d.name);
+      await store.current.deleteFile(d.name);
     } catch (e) {
       return alert(`Could not delete: ${errMsg(e)}`);
     }
@@ -216,7 +222,7 @@ export default function MarkdownApp() {
 
   const saveHighlights = (name: string, list: Highlight[]) => {
     setHl((h) => ({ ...h, [name]: list }));
-    setHighlights(name, list).catch((e) => alert(`Could not save highlight: ${errMsg(e)}`));
+    store.current.setHighlights(name, list).catch((e) => alert(`Could not save highlight: ${errMsg(e)}`));
   };
 
   const rename = async (d: Doc, input: string) => {
@@ -229,7 +235,7 @@ export default function MarkdownApp() {
     try {
       clearTimeout(saveTimer.current);
       await flush(); // write pending edits first so a late save can't recreate the old file
-      await renameFile(d.name, to, d.content);
+      await store.current.renameFile(d.name, to, d.content);
     } catch (e) {
       return alert(`Could not rename: ${errMsg(e)}`);
     }
@@ -461,7 +467,7 @@ export default function MarkdownApp() {
           <span className="flex items-center gap-1"><Type className="size-3.5" /> {(active?.content.length ?? 0).toLocaleString()} Chars</span>
         </div>
         <span className={cn("flex items-center gap-1", status === "error" ? "text-destructive" : status === "saved" && "text-emerald-600 dark:text-emerald-400")}>
-          {status === "error" ? "Save failed — will retry on next edit" : status === "saved" ? <><Check className="size-3.5" /> Saved to data/</> : "Saving…"}
+          {status === "error" ? "Save failed — will retry on next edit" : status === "saved" ? <><Check className="size-3.5" /> {storageKind === "disk" ? "Saved to data/" : "Saved in this browser"}</> : "Saving…"}
         </span>
       </footer>
 
@@ -470,7 +476,10 @@ export default function MarkdownApp() {
           <AlertDialogHeader>
             <AlertDialogTitle>Delete &ldquo;{toDelete?.name}&rdquo;?</AlertDialogTitle>
             <AlertDialogDescription>
-              This permanently deletes <code>data/{toDelete?.name}.md</code> from disk. This cannot be undone.
+              {storageKind === "disk"
+                ? <>This permanently deletes <code>data/{toDelete?.name}.md</code> from disk.</>
+                : <>This permanently deletes it from this browser. Download it first if you want a copy.</>}{" "}
+              This cannot be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
