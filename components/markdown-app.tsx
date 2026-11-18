@@ -32,7 +32,7 @@ type Doc = { id: string; name: string; content: string; updatedAt: number; fav?:
 type State = { docs: Doc[]; openIds: string[]; activeId: string | null };
 type Ui = { openIds: string[]; activeId: string | null; favs: string[] };
 type View = "edit" | "split" | "preview" | "read";
-type Picked = { file: File; path: string }; // an imported file and its path inside the picked/dropped folder
+type Picked = { file: File; path: string }; // an uploaded file and its path inside the picked folder
 type DeleteTarget = { kind: "file"; doc: Doc } | { kind: "folder"; path: string; count: number };
 const DRAG_TYPE = "text/x-md-path"; // internal drag of a file onto a folder (move)
 
@@ -68,27 +68,8 @@ function download(filename: string, text: string, type: string) {
 
 const stripExt = (n: string) => n.replace(/\.(md|markdown|txt)$/i, "");
 
-// Dropped items can be folders: walk them recursively to get every file inside, keeping its folder path.
+// Files from the upload pickers; webkitRelativePath keeps folder structure (plan/api.md).
 const fromInput = (files: FileList): Picked[] => [...files].map((file) => ({ file, path: file.webkitRelativePath || file.name }));
-
-function filesFromDrop(dt: DataTransfer): Promise<Picked[]> {
-  const walk = async (entry: FileSystemEntry | File | null): Promise<Picked[]> => {
-    if (entry instanceof File) return [{ file: entry, path: entry.name }];
-    if (!entry || entry.name.startsWith(".")) return [];
-    if (entry.isFile) {
-      const file = await new Promise<File>((res, rej) => (entry as FileSystemFileEntry).file(res, rej));
-      return [{ file, path: entry.fullPath.replace(/^\//, "") }]; // "/plan/api.md" → "plan/api.md"
-    }
-    const reader = (entry as FileSystemDirectoryEntry).createReader();
-    const entries: FileSystemEntry[] = [];
-    // readEntries returns batches (Chrome: ≤100) until an empty one
-    for (let batch; (batch = await new Promise<FileSystemEntry[]>((res, rej) => reader.readEntries(res, rej))).length; ) entries.push(...batch);
-    return (await Promise.all(entries.map(walk))).flat();
-  };
-  // webkitGetAsEntry must be called synchronously, before the DataTransfer expires.
-  const roots = [...dt.items].filter((i) => i.kind === "file").map((i) => i.webkitGetAsEntry() ?? i.getAsFile());
-  return Promise.all(roots.map(walk)).then((r) => r.flat());
-}
 
 export default function MarkdownApp() {
   const [ui] = useState(loadUi);
@@ -112,7 +93,6 @@ export default function MarkdownApp() {
   const [draftFolderIn, setDraftFolderIn] = useState<string | null>(null); // parent path showing a "new folder" input
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   const importDir = useRef(""); // folder that the next upload goes into ("" = top level)
-  const [dragging, setDragging] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const folderInput = useRef<HTMLInputElement>(null);
   const editorScroll = useRef<HTMLDivElement>(null);
@@ -343,7 +323,7 @@ export default function MarkdownApp() {
     setHl(({ [d.name]: list, ...rest }) => (list ? { ...rest, [to]: list } : rest)); // server already moved them
   };
 
-  // Accepts loose files or whole folders (picker or drop) and keeps their folder structure, e.g. plan/api.md.
+  // Accepts loose files or whole folders from the upload pickers and keeps their folder structure, e.g. plan/api.md.
   // Only markdown is kept; anything inside hidden folders like .git is skipped.
   const importFiles = async (items: Picked[]) => {
     const dir = importDir.current;
@@ -371,12 +351,6 @@ export default function MarkdownApp() {
     const el = e.currentTarget, p = previewScroll.current;
     if (!p) return;
     p.scrollTop = (el.scrollTop / Math.max(1, el.scrollHeight - el.clientHeight)) * (p.scrollHeight - p.clientHeight);
-  };
-
-  const onDrop = async (e: DragEvent) => {
-    e.preventDefault();
-    setDragging(false);
-    importFiles(await filesFromDrop(e.dataTransfer));
   };
 
   // Internal drag: drop a file onto a folder (or the empty list area = top level) to move it there.
@@ -548,13 +522,13 @@ export default function MarkdownApp() {
   return (
     <div
       className="relative flex h-screen flex-col bg-background text-foreground"
+      // Drag-and-drop import is off: swallow OS file drops so the browser doesn't navigate away to the file.
       onDragOver={(e) => {
-        if (!e.dataTransfer.types.includes("Files")) return; // only OS files/folders, not internal moves
+        if (!e.dataTransfer.types.includes("Files")) return;
         e.preventDefault();
-        setDragging(true);
+        e.dataTransfer.dropEffect = "none";
       }}
-      onDragLeave={(e) => e.currentTarget === e.target && setDragging(false)}
-      onDrop={onDrop}
+      onDrop={(e) => e.dataTransfer.types.includes("Files") && e.preventDefault()}
     >
       <input ref={fileInput} type="file" accept=".md,.markdown,text/markdown" multiple hidden
         onChange={(e) => (e.target.files && importFiles(fromInput(e.target.files)), (e.target.value = ""))} />
@@ -676,7 +650,7 @@ export default function MarkdownApp() {
               <div className="flex h-full items-center justify-center text-muted-foreground">Loading files…</div>
             ) : !active ? (
               <div className="flex h-full flex-col items-center justify-center gap-3 text-muted-foreground">
-                <p>No file open. Create one, or drop .md files or a folder here.</p>
+                <p>No file open. Create a new file, or upload .md files or a folder.</p>
                 <div className="flex gap-2">
                   <Button onClick={() => create()}><Plus /> New file</Button>
                   <Button variant="outline" onClick={() => upload("", "files")}><FileUp /> Open file</Button>
@@ -732,11 +706,6 @@ export default function MarkdownApp() {
         </AlertDialogContent>
       </AlertDialog>
 
-      {dragging && (
-        <div className="pointer-events-none absolute inset-0 z-50 flex items-center justify-center border-2 border-dashed border-sky-500 bg-background/80 text-lg">
-          Drop .md files or folders to import
-        </div>
-      )}
     </div>
   );
 }
